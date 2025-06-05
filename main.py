@@ -58,6 +58,7 @@ class Article:
     summary: str = ""
     sentiment_score: float = 0.0
     importance_score: float = 0.0
+    relevancy_score: float = 0.0 # New field for relevancy
     cluster_id: int = -1
 
 @dataclass
@@ -122,11 +123,14 @@ class PerformanceMonitor:
         }
 
 class NewsGenerator:
-    def __init__(self, feeds_file: str = "feeds.yaml"):
+    def __init__(self, feeds_file: str = "feeds.yaml", topic: Optional[str] = None, guidance: Optional[str] = None):
         self.feeds_file = feeds_file
         self.db_path = "news_cache.db"
         self.circuit_breaker = CircuitBreaker()
         self.performance_monitor = PerformanceMonitor()
+        self.topic = topic
+        self.guidance = guidance
+        self.relevancy_threshold = 5 # Default threshold
         self.setup_logging()
         self.setup_database()
         self.setup_nlp()
@@ -283,22 +287,30 @@ class NewsGenerator:
             
         start_time = datetime.now()
         
-        # Parallel processing with thread pool
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        async with aiohttp.ClientSession() as session:
             # Generate summaries
-            summary_futures = {
-                executor.submit(self.generate_summary_safe, article): article 
-                for article in articles
-            }
+            summary_tasks = [self.generate_summary_safe(session, article) for article in articles]
+            summaries = await asyncio.gather(*summary_tasks, return_exceptions=True)
             
-            for future in as_completed(summary_futures):
-                article = summary_futures[future]
-                try:
-                    article.summary = future.result()
-                except Exception as e:
-                    self.logger.error(f"Summary failed: {e}")
-                    article.summary = article.content[:150] + "..."
+            for i, result in enumerate(summaries):
+                if isinstance(result, Exception):
+                    self.logger.error(f"Summary failed for {articles[i].title}: {result}")
+                    articles[i].summary = articles[i].content[:150] + "..."
+                else:
+                    articles[i].summary = result
         
+            # Calculate relevancy scores if a topic is provided
+            if self.topic:
+                relevancy_tasks = [self.calculate_relevancy_score(session, article) for article in articles]
+                relevancy_scores = await asyncio.gather(*relevancy_tasks, return_exceptions=True)
+                
+                for i, result in enumerate(relevancy_scores):
+                    if isinstance(result, Exception):
+                        self.logger.error(f"Relevancy scoring failed for {articles[i].title}: {result}")
+                        articles[i].relevancy_score = 0.0 # Default to 0 on failure
+                    else:
+                        articles[i].relevancy_score = result
+
         # Fast clustering using TF-IDF (more reliable than API embeddings)
         self.cluster_articles_tfidf(articles)
         
@@ -310,15 +322,15 @@ class NewsGenerator:
         
         return articles
 
-    def generate_summary_safe(self, article: Article) -> str:
-        """Safe summary generation with circuit breaker"""
+    async def generate_summary_safe(self, session: aiohttp.ClientSession, article: Article) -> str:
+        """Safe summary generation with circuit breaker using aiohttp"""
         if not self.circuit_breaker.can_execute():
             return article.content[:150] + "..."
         
         prompt = f"Summarize in 2 sentences: {article.title}\n{article.content[:500]}"
         
         try:
-            response = requests.post(
+            async with session.post(
                 f"{CONFIG['ollama_api']['base_url']}/api/generate",
                 json={
                     'model': CONFIG["models"]["summary_model"],
@@ -326,20 +338,76 @@ class NewsGenerator:
                     'stream': False,
                     'options': {'temperature': 0.3, 'max_tokens': 100}
                 },
-                timeout=30
-            )
-            
-            if response.status_code == 200:
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
                 self.circuit_breaker.record_success()
-                return response.json()['response'].strip()
-            else:
-                self.circuit_breaker.record_failure()
-                return article.content[:150] + "..."
+                return data['response'].strip()
                 
-        except Exception as e:
+        except aiohttp.ClientResponseError as e:
+            error_detail = await e.response.text() if e.response else "No response body"
+            self.logger.error(f"Summary LLM API error (status: {e.status}): {error_detail}")
             self.circuit_breaker.record_failure()
-            self.logger.error(f"Summary error: {e}")
-            return article.content[:150] + "..."
+            article.summary = article.content[:150] + "..."
+        except aiohttp.ClientError as e:
+            self.logger.error(f"Network error during summary LLM call: {e}")
+            self.circuit_breaker.record_failure()
+            article.summary = article.content[:150] + "..."
+        except Exception as e:
+            self.logger.error(f"Unexpected error during summary LLM call: {e}")
+            self.circuit_breaker.record_failure()
+            article.summary = article.content[:150] + "..."
+
+    async def calculate_relevancy_score(self, session: aiohttp.ClientSession, article: Article) -> float:
+        """Calculate relevancy score using LLM with aiohttp"""
+        if not self.topic or not self.circuit_breaker.can_execute():
+            return 0.0 # Default to 0 if no topic or circuit open
+        
+        prompt = f"""Given the topic: "{self.topic}"
+        
+        Score the following article from 0 to 10 on how relevant it is to the topic.
+        Return only the score as a single number.
+        
+        Article Title: {article.title}
+        Article Summary: {article.summary}
+        """
+        
+        try:
+            async with session.post(
+                f"{CONFIG['ollama_api']['base_url']}/api/generate",
+                json={
+                    'model': CONFIG["models"]["summary_model"], # Using summary model for scoring
+                    'prompt': prompt,
+                    'stream': False,
+                    'options': {'temperature': 0.1, 'max_tokens': 5} # Low temperature for score
+                },
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+                self.circuit_breaker.record_success()
+                score_str = data['response'].strip()
+                try:
+                    score = float(score_str)
+                    return max(0.0, min(10.0, score)) # Ensure score is between 0 and 10
+                except ValueError:
+                    self.logger.warning(f"LLM returned non-numeric relevancy score: '{score_str}'")
+                    return 0.0
+            
+        except aiohttp.ClientResponseError as e:
+            error_detail = await e.response.text() if e.response else "No response body"
+            self.logger.error(f"Relevancy scoring LLM API error (status: {e.status}): {error_detail}")
+            self.circuit_breaker.record_failure()
+            article.relevancy_score = 0.0
+        except aiohttp.ClientError as e:
+            self.logger.error(f"Network error during relevancy scoring LLM call: {e}")
+            self.circuit_breaker.record_failure()
+            article.relevancy_score = 0.0
+        except Exception as e:
+            self.logger.error(f"Unexpected error during relevancy scoring LLM call: {e}")
+            self.circuit_breaker.record_failure()
+            article.relevancy_score = 0.0
 
     def cluster_articles_tfidf(self, articles: List[Article]):
         """Fast TF-IDF based clustering"""
@@ -400,6 +468,14 @@ class NewsGenerator:
         segments = []
         clusters = {}
         
+        # Filter articles by relevancy threshold if a topic is provided
+        if self.topic:
+            articles = [a for a in articles if a.relevancy_score >= self.relevancy_threshold]
+            self.logger.info(f"Filtered to {len(articles)} articles above relevancy threshold ({self.relevancy_threshold}) for topic '{self.topic}'")
+            if not articles:
+                self.logger.warning("No articles met the relevancy threshold for the given topic.")
+                return []
+
         for article in articles:
             cluster_id = article.cluster_id
             if cluster_id not in clusters:
@@ -411,7 +487,7 @@ class NewsGenerator:
                 continue
             
             cluster_articles.sort(key=lambda x: x.importance_score, reverse=True)
-            topic = self.extract_topic(cluster_articles[:2])
+            topic = self.extract_topic(articles[:2])
             selected_articles = cluster_articles[:2]
             avg_importance = np.mean([a.importance_score for a in selected_articles])
             
@@ -430,6 +506,10 @@ class NewsGenerator:
         """Simple topic extraction"""
         if not articles:
             return "General News"
+        
+        # If a specific topic is provided, use it
+        if self.topic:
+            return self.topic
         
         # Extract key words from titles
         all_words = []
@@ -468,6 +548,12 @@ class NewsGenerator:
         if len(full_script) > CONFIG["output"]["max_broadcast_length"]:
             full_script = full_script[:CONFIG["output"]["max_broadcast_length"]]
         
+        async with aiohttp.ClientSession() as session:
+            # Refinement prompt
+            if self.guidance:
+                self.logger.info("Applying refinement prompt to the full script.")
+                full_script = await self.refine_script(session, full_script, self.guidance)
+
         return self.clean_script_for_tts(full_script)
 
     async def generate_segment_script(self, segment: BroadcastSegment) -> str:
@@ -479,28 +565,77 @@ class NewsGenerator:
 
 Write 2-3 sentences in news anchor style. Start directly with the news:"""
         
+        # Add guidance to the prompt if available
+        if self.guidance:
+            prompt += f"\n\nGuidance for script generation: {self.guidance}"
+
         try:
-            response = requests.post(
-                f"{CONFIG['ollama_api']['base_url']}/api/generate",
-                json={
-                    'model': CONFIG["models"]["broadcast_model"],
-                    'prompt': prompt,
-                    'stream': False,
-                    'options': {'temperature': 0.4, 'max_tokens': 300}
-                },
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                return response.json()['response'].strip()
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{CONFIG['ollama_api']['base_url']}/api/generate",
+                    json={
+                        'model': CONFIG["models"]["broadcast_model"],
+                        'prompt': prompt,
+                        'stream': False,
+                        'options': {'temperature': 0.4, 'max_tokens': 300}
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    return data['response'].strip()
                 
+        except aiohttp.ClientResponseError as e:
+            error_detail = await e.response.text() if e.response else "No response body"
+            self.logger.error(f"Script generation LLM API error (status: {e.status}): {error_detail}")
+        except aiohttp.ClientError as e:
+            self.logger.error(f"Network error during script generation LLM call: {e}")
         except Exception as e:
-            self.logger.error(f"Script generation error: {e}")
+            self.logger.error(f"Unexpected error during script generation LLM call: {e}")
         
         # Fallback
         if segment.articles:
             return f"In {segment.topic} news, {segment.articles[0].title}."
         return f"Updates on {segment.topic}."
+
+    async def refine_script(self, session: aiohttp.ClientSession, script: str, guidance: str) -> str:
+        """Refine the generated script based on guidance using aiohttp"""
+        prompt = f"""Refine the following news script based on the provided guidance.
+        
+        Original Script:
+        {script}
+        
+        Guidance for refinement:
+        {guidance}
+        
+        Return the refined script:"""
+        
+        try:
+            async with session.post(
+                f"{CONFIG['ollama_api']['base_url']}/api/generate",
+                json={
+                    'model': CONFIG["models"]["broadcast_model"], # Use broadcast model for refinement
+                    'prompt': prompt,
+                    'stream': False,
+                    'options': {'temperature': 0.5, 'max_tokens': CONFIG["output"]["max_broadcast_length"]}
+                },
+                timeout=aiohttp.ClientTimeout(total=60)
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+                self.logger.info("Script refined successfully.")
+                return data['response'].strip()
+            
+        except aiohttp.ClientResponseError as e:
+            error_detail = await e.response.text() if e.response else "No response body"
+            self.logger.error(f"Script refinement LLM API error (status: {e.status}): {error_detail}")
+            return script # Return original script on error
+        except aiohttp.ClientError as e:
+            self.logger.error(f"Network error during script refinement LLM call: {e}")
+            return script # Return original script on error
+        except Exception as e:
+            self.logger.error(f"Unexpected error during script refinement LLM call: {e}")
+            return script # Return original script on error
 
     def clean_script_for_tts(self, script: str) -> str:
         """Clean script for TTS"""
@@ -570,7 +705,7 @@ Write 2-3 sentences in news anchor style. Start directly with the news:"""
         for i, segment in enumerate(segments, 1):
             content += f"\n### {i}. {segment.topic} (Score: {segment.importance:.2f})\n"
             for article in segment.articles:
-                content += f"- {article.title} ({article.source})\n"
+                content += f"- {article.title} ({article.source}) - Relevancy: {article.relevancy_score:.1f}/10\n"
         
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write(content)
@@ -611,7 +746,19 @@ Write 2-3 sentences in news anchor style. Start directly with the news:"""
             raise
 
 def main():
-    generator = NewsGenerator()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Generate news broadcasts from RSS feeds.")
+    parser.add_argument("--topic", type=str, help="Optional topic to filter and focus news generation.")
+    parser.add_argument("--guidance", type=str, help="Optional guidance for refining the news script.")
+    parser.add_argument("--relevancy_threshold", type=int, default=5,
+                        help="Minimum relevancy score (0-10) for articles to be included when a topic is provided. Default is 5.")
+    
+    args = parser.parse_args()
+
+    generator = NewsGenerator(topic=args.topic, guidance=args.guidance)
+    generator.relevancy_threshold = args.relevancy_threshold
+    
     asyncio.run(generator.run())
 
 if __name__ == "__main__":
